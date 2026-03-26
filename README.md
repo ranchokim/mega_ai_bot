@@ -43,6 +43,7 @@ OI_FALLBACK_COMMAND_TEMPLATE=python3 -m interpreter --yes --offline --message {p
 OI_TIMEOUT_SECONDS=1800
 OI_OUTPUT_LIMIT=3500
 MULTI_MAX_CHARS_PER_STAGE=1400
+CHAIN_WORKSPACE_DIR=workspace_steps
 ```
 
 > 보안 권장: 토큰이 이미 외부에 노출됐다면 BotFather에서 즉시 재발급(rotate) 하세요.
@@ -68,3 +69,12 @@ python3 local_multi_ai_assistant.py
 - `/oi`는 실제 로컬 명령을 실행할 수 있으므로 운영 환경에서 접근 가능한 텔레그램 사용자/채팅을 제한하세요.
 - 필요 시 `ENABLE_OPEN_INTERPRETER=false`로 즉시 비활성화할 수 있습니다.
 - `/oi` 실패 시 기본 명령(`OI_COMMAND_TEMPLATE`) 이후 fallback 명령(`OI_FALLBACK_COMMAND_TEMPLATE`)을 순차 시도합니다.
+
+## 단계별 결과 파일 저장
+- 멀티 모델 체인은 각 단계 결과를 워크스페이스 디렉토리에 파일로 저장합니다.
+- 기본 디렉토리: `workspace_steps` (환경변수 `CHAIN_WORKSPACE_DIR`로 변경 가능)
+- 파일명 형식:
+  - `{request_id}_01_plan_{model}.md`
+  - `{request_id}_02_specialist_{model}.md`
+  - `{request_id}_03_review_{model}.md`
+  - `{request_id}_04_synthesis_{model}.md`

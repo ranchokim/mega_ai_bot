@@ -78,6 +78,7 @@ class BotConfig:
     oi_timeout_seconds: int = int(os.getenv("OI_TIMEOUT_SECONDS", "1800"))
     oi_output_limit: int = int(os.getenv("OI_OUTPUT_LIMIT", "3500"))
     multi_max_chars_per_stage: int = int(os.getenv("MULTI_MAX_CHARS_PER_STAGE", "1400"))
+    workspace_dir: str = os.getenv("CHAIN_WORKSPACE_DIR", "workspace_steps")
 
 
 def tg_api(method: str, payload: dict) -> dict:
@@ -221,7 +222,27 @@ def summarize_for_chain(text: str) -> str:
     return cleaned[: BotConfig.multi_max_chars_per_stage] + "\n...(중간 출력 생략)"
 
 
-def run_multi_model_chain(chat_id: int, status_msg_id: int, task: str, specialist: ModelProfile) -> str:
+def _safe_model_name(model_name: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in model_name)
+
+
+def save_chain_stage_result(request_id: str, stage_idx: int, stage_name: str, model_name: str, content: str) -> str:
+    os.makedirs(BotConfig.workspace_dir, exist_ok=True)
+    safe_model = _safe_model_name(model_name)
+    file_name = f"{request_id}_{stage_idx:02d}_{stage_name}_{safe_model}.md"
+    file_path = os.path.join(BotConfig.workspace_dir, file_name)
+    with open(file_path, "w", encoding="utf-8") as fp:
+        fp.write(content.strip() + "\n")
+    return file_path
+
+
+def run_multi_model_chain(
+    chat_id: int,
+    status_msg_id: int,
+    task: str,
+    specialist: ModelProfile,
+    request_id: str,
+) -> str:
     planner = MODEL_PROFILES["fast"]
     verifier = MODEL_PROFILES["fallback"]
     synthesizer = MODEL_PROFILES["general"]
@@ -232,6 +253,7 @@ def run_multi_model_chain(chat_id: int, status_msg_id: int, task: str, specialis
         "최대 8줄로 작성."
     )
     plan = generate_with_ollama(planner.name, task, planner_system)
+    plan_path = save_chain_stage_result(request_id, 1, "plan", planner.name, plan)
     edit_message(chat_id, status_msg_id, f"진행중 1/4: 계획 수립 완료 ({planner.name})")
 
     specialist_system = (
@@ -241,6 +263,7 @@ def run_multi_model_chain(chat_id: int, status_msg_id: int, task: str, specialis
     )
     specialist_prompt = f"[사용자 요청]\n{task}\n\n[계획]\n{summarize_for_chain(plan)}"
     specialist_answer = generate_with_ollama(specialist.name, specialist_prompt, specialist_system)
+    specialist_path = save_chain_stage_result(request_id, 2, "specialist", specialist.name, specialist_answer)
     edit_message(chat_id, status_msg_id, f"진행중 2/4: 전문가 초안 완료 ({specialist.name})")
 
     verifier_system = (
@@ -252,6 +275,7 @@ def run_multi_model_chain(chat_id: int, status_msg_id: int, task: str, specialis
         f"[사용자 요청]\n{task}\n\n[전문가 초안]\n{summarize_for_chain(specialist_answer)}"
     )
     review = generate_with_ollama(verifier.name, verifier_prompt, verifier_system)
+    review_path = save_chain_stage_result(request_id, 3, "review", verifier.name, review)
     edit_message(chat_id, status_msg_id, f"진행중 3/4: 검토 완료 ({verifier.name})")
 
     synth_system = (
@@ -267,7 +291,16 @@ def run_multi_model_chain(chat_id: int, status_msg_id: int, task: str, specialis
         f"[검토 결과]\n{summarize_for_chain(review)}"
     )
     final_answer = generate_with_ollama(synthesizer.name, synth_prompt, synth_system)
+    final_path = save_chain_stage_result(request_id, 4, "synthesis", synthesizer.name, final_answer)
     edit_message(chat_id, status_msg_id, f"진행중 4/4: 최종 합성 완료 ({synthesizer.name})")
+    send_message(
+        chat_id,
+        "단계별 결과 파일 저장 완료:\n"
+        f"1) {plan_path}\n"
+        f"2) {specialist_path}\n"
+        f"3) {review_path}\n"
+        f"4) {final_path}",
+    )
     return final_answer
 
 
@@ -281,8 +314,9 @@ def handle_ollama(chat_id: int, msg_id: int, task: str, profile: ModelProfile) -
     status_msg_id = status_msg["message_id"]
 
     start = time.time()
+    request_id = f"{int(start)}_{chat_id}_{msg_id}"
     try:
-        answer = run_multi_model_chain(chat_id, status_msg_id, task, profile)
+        answer = run_multi_model_chain(chat_id, status_msg_id, task, profile, request_id)
         elapsed = time.time() - start
         edit_message(chat_id, status_msg_id, f"완료: {elapsed:.1f}초\n엔진: Ollama 멀티 모델 순차 협업")
         send_message(chat_id, answer, reply_to=msg_id)
