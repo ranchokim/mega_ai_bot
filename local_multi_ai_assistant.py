@@ -1,0 +1,317 @@
+#!/usr/bin/env python3
+"""Telegram + Ollama + Open Interpreter 멀티 로컬 AI 비서."""
+
+from __future__ import annotations
+
+import os
+import shlex
+import subprocess
+import time
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+import requests
+from dotenv import load_dotenv
+
+
+load_dotenv()
+
+
+@dataclass(frozen=True)
+class ModelProfile:
+    name: str
+    role: str
+    description: str
+    recommended: bool = False
+
+
+MODEL_PROFILES: Dict[str, ModelProfile] = {
+    "fast": ModelProfile(
+        name="qwen3:latest",
+        role="빠른 일반 대화",
+        description="5.2GB급으로 응답속도/품질 균형이 좋아 기본 엔진으로 추천",
+        recommended=True,
+    ),
+    "general": ModelProfile(
+        name="llama3.1:8b",
+        role="일반 지식/작성",
+        description="4.9GB급으로 안정적인 품질",
+    ),
+    "code": ModelProfile(
+        name="qwen3-coder:30b",
+        role="코드/디버깅",
+        description="고품질 코드 모델(느릴 수 있음)",
+    ),
+    "reason": ModelProfile(
+        name="deepseek-r1:32b",
+        role="고난도 추론",
+        description="추론 품질 우수(매우 느릴 수 있음)",
+    ),
+    "fallback": ModelProfile(
+        name="phi3:latest",
+        role="긴급 경량 대체",
+        description="2.2GB급으로 리소스 부족 시 사용",
+    ),
+}
+
+
+class BotConfig:
+    token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    ollama_url: str = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+    timeout_seconds: int = int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "1800"))
+    max_context_tokens: int = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
+
+    enable_open_interpreter: bool = os.getenv("ENABLE_OPEN_INTERPRETER", "true").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    oi_command_template: str = os.getenv(
+        "OI_COMMAND_TEMPLATE",
+        'interpreter --yes --offline --message {prompt}',
+    )
+    oi_timeout_seconds: int = int(os.getenv("OI_TIMEOUT_SECONDS", "1800"))
+    oi_output_limit: int = int(os.getenv("OI_OUTPUT_LIMIT", "3500"))
+
+
+def tg_api(method: str, payload: dict) -> dict:
+    url = f"https://api.telegram.org/bot{BotConfig.token}/{method}"
+    resp = requests.post(url, json=payload, timeout=60)
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram API error: {data}")
+    return data["result"]
+
+
+def send_message(chat_id: int, text: str, reply_to: Optional[int] = None) -> dict:
+    payload = {"chat_id": chat_id, "text": text}
+    if reply_to is not None:
+        payload["reply_to_message_id"] = reply_to
+    return tg_api("sendMessage", payload)
+
+
+def edit_message(chat_id: int, message_id: int, text: str) -> None:
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
+    tg_api("editMessageText", payload)
+
+
+def get_updates(offset: Optional[int]) -> List[dict]:
+    payload = {"timeout": 30, "allowed_updates": ["message"]}
+    if offset is not None:
+        payload["offset"] = offset
+    return tg_api("getUpdates", payload)
+
+
+def route_task(text: str) -> Tuple[str, str]:
+    lowered = text.lower().strip()
+
+    if lowered.startswith("/oi") or lowered.startswith("/open_interpreter"):
+        cleaned = text.split(" ", 1)[1].strip() if " " in text else ""
+        return "oi", cleaned
+
+    if lowered.startswith("/code") or any(k in lowered for k in ["코드", "bug", "debug", "python", "js", "sql"]):
+        return "ollama_code", text.replace("/code", "", 1).strip()
+    if lowered.startswith("/reason") or any(k in lowered for k in ["추론", "증명", "논리", "reason"]):
+        return "ollama_reason", text.replace("/reason", "", 1).strip()
+    if lowered.startswith("/fast"):
+        return "ollama_fast", text.replace("/fast", "", 1).strip()
+    if lowered.startswith("/general"):
+        return "ollama_general", text.replace("/general", "", 1).strip()
+
+    return "ollama_fast", text
+
+
+def generate_with_ollama(model: str, prompt: str) -> str:
+    system_prompt = (
+        "당신은 한국어 우선의 로컬 AI 비서다.\n"
+        "- 답변은 실행 가능한 단계로 제시한다.\n"
+        "- 장문 작업은 핵심 요약을 먼저 제공한다.\n"
+        "- 불확실하면 가정 사항을 명확히 밝힌다."
+    )
+    payload = {
+        "model": model,
+        "stream": False,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ],
+        "options": {
+            "num_ctx": BotConfig.max_context_tokens,
+            "temperature": 0.4,
+        },
+        "keep_alive": "10m",
+    }
+
+    url = f"{BotConfig.ollama_url}/api/chat"
+    response = requests.post(url, json=payload, timeout=BotConfig.timeout_seconds)
+    response.raise_for_status()
+    data = response.json()
+    return data.get("message", {}).get("content", "(응답이 비어 있습니다)")
+
+
+def generate_with_open_interpreter(prompt: str) -> str:
+    if not BotConfig.enable_open_interpreter:
+        return "Open Interpreter 기능이 비활성화되어 있습니다. (.env에서 ENABLE_OPEN_INTERPRETER=true 설정)"
+
+    quoted_prompt = shlex.quote(prompt)
+    command = BotConfig.oi_command_template.format(prompt=quoted_prompt)
+
+    completed = subprocess.run(
+        command,
+        shell=True,
+        text=True,
+        capture_output=True,
+        timeout=BotConfig.oi_timeout_seconds,
+    )
+
+    stdout = (completed.stdout or "").strip()
+    stderr = (completed.stderr or "").strip()
+
+    if completed.returncode != 0:
+        raise RuntimeError(f"Open Interpreter 실패(code={completed.returncode}): {stderr or 'stderr 없음'}")
+
+    combined = stdout if stdout else "(Open Interpreter 출력 없음)"
+    if stderr:
+        combined += f"\n\n[stderr]\n{stderr}"
+
+    if len(combined) > BotConfig.oi_output_limit:
+        combined = combined[: BotConfig.oi_output_limit] + "\n\n... (출력 잘림)"
+
+    return combined
+
+
+def format_models() -> str:
+    lines = ["사용 가능한 멀티 비서 프로필:"]
+    for key, profile in MODEL_PROFILES.items():
+        tag = " (기본)" if profile.recommended else ""
+        lines.append(f"- {key}: {profile.name}{tag} | {profile.role}")
+    lines.append("- oi: Open Interpreter CLI 실행")
+    lines.append("\n명령 예시: /fast 질문, /code 코드질문, /reason 복잡한추론, /oi 쉘작업")
+    return "\n".join(lines)
+
+
+def handle_ollama(chat_id: int, msg_id: int, task: str, profile: ModelProfile) -> None:
+    status_msg = send_message(
+        chat_id,
+        f"진행중: 작업 분석 완료\n엔진: Ollama\n선택 모델: {profile.name}\n이제 생성 시작...",
+        reply_to=msg_id,
+    )
+    status_msg_id = status_msg["message_id"]
+
+    start = time.time()
+    try:
+        answer = generate_with_ollama(profile.name, task)
+        elapsed = time.time() - start
+        edit_message(chat_id, status_msg_id, f"완료: {elapsed:.1f}초\n엔진: Ollama\n모델: {profile.name}")
+        send_message(chat_id, answer, reply_to=msg_id)
+    except Exception as exc:
+        fallback = MODEL_PROFILES["fallback"]
+        try:
+            edit_message(chat_id, status_msg_id, f"오류: {profile.name} 실패 → {fallback.name} 재시도")
+            answer = generate_with_ollama(fallback.name, task)
+            send_message(chat_id, f"(fallback:{fallback.name})\n\n{answer}", reply_to=msg_id)
+        except Exception as exc2:
+            send_message(chat_id, f"요청 처리 실패: {exc}\nfallback 실패: {exc2}", reply_to=msg_id)
+
+
+def handle_oi(chat_id: int, msg_id: int, task: str) -> None:
+    status_msg = send_message(
+        chat_id,
+        "진행중: Open Interpreter 작업 시작\n환경 점검 후 실행합니다...",
+        reply_to=msg_id,
+    )
+    status_msg_id = status_msg["message_id"]
+
+    start = time.time()
+    try:
+        answer = generate_with_open_interpreter(task)
+        elapsed = time.time() - start
+        edit_message(chat_id, status_msg_id, f"완료: {elapsed:.1f}초\n엔진: Open Interpreter")
+        send_message(chat_id, answer, reply_to=msg_id)
+    except Exception as exc:
+        edit_message(chat_id, status_msg_id, "실패: Open Interpreter 실행 중 오류")
+        send_message(chat_id, f"Open Interpreter 오류: {exc}", reply_to=msg_id)
+
+
+def handle_command(chat_id: int, msg_id: int, text: str) -> None:
+    cmd = text.strip()
+    if cmd == "/start":
+        send_message(
+            chat_id,
+            "로컬 멀티 AI 비서가 시작되었습니다.\n"
+            "- Ollama: /fast /general /code /reason\n"
+            "- Open Interpreter: /oi\n"
+            "- 모델목록: /models\n"
+            "- 상태: /status\n"
+            "아무 텍스트나 보내도 기본 fast 라우팅합니다.",
+            reply_to=msg_id,
+        )
+        return
+
+    if cmd == "/models":
+        send_message(chat_id, format_models(), reply_to=msg_id)
+        return
+
+    if cmd == "/status":
+        oi_enabled = "ON" if BotConfig.enable_open_interpreter else "OFF"
+        send_message(
+            chat_id,
+            f"상태: 정상 동작 중\n- Telegram polling: ON\n- Ollama URL: {BotConfig.ollama_url}\n- Open Interpreter: {oi_enabled}",
+            reply_to=msg_id,
+        )
+        return
+
+    route, task = route_task(text)
+    if not task.strip():
+        send_message(chat_id, "질문 내용을 함께 보내주세요. 예: /oi 현재 디렉터리 파일 요약", reply_to=msg_id)
+        return
+
+    if route == "oi":
+        handle_oi(chat_id, msg_id, task)
+        return
+
+    profile_key = route.replace("ollama_", "")
+    profile = MODEL_PROFILES[profile_key]
+    handle_ollama(chat_id, msg_id, task, profile)
+
+
+def main() -> None:
+    if not BotConfig.token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN 환경변수가 필요합니다.")
+
+    print("[boot] Telegram polling bot start")
+    print(f"[boot] Ollama URL: {BotConfig.ollama_url}")
+    print(f"[boot] Open Interpreter enabled: {BotConfig.enable_open_interpreter}")
+
+    offset: Optional[int] = None
+
+    while True:
+        try:
+            updates = get_updates(offset)
+            for update in updates:
+                offset = update["update_id"] + 1
+                message = update.get("message")
+                if not message:
+                    continue
+
+                chat_id = message["chat"]["id"]
+                msg_id = message["message_id"]
+                text = message.get("text", "").strip()
+
+                if not text:
+                    send_message(chat_id, "텍스트 메시지만 처리할 수 있습니다.", reply_to=msg_id)
+                    continue
+
+                handle_command(chat_id, msg_id, text)
+        except requests.RequestException as net_err:
+            print(f"[warn] network error: {net_err}")
+            time.sleep(3)
+        except Exception as err:
+            print(f"[warn] loop error: {err}")
+            time.sleep(3)
+
+
+if __name__ == "__main__":
+    main()
