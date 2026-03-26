@@ -71,6 +71,10 @@ class BotConfig:
         "OI_COMMAND_TEMPLATE",
         'interpreter --yes --offline --message {prompt}',
     )
+    oi_fallback_command_template: str = os.getenv(
+        "OI_FALLBACK_COMMAND_TEMPLATE",
+        'python3 -m interpreter --yes --offline --message {prompt}',
+    )
     oi_timeout_seconds: int = int(os.getenv("OI_TIMEOUT_SECONDS", "1800"))
     oi_output_limit: int = int(os.getenv("OI_OUTPUT_LIMIT", "3500"))
     multi_max_chars_per_stage: int = int(os.getenv("MULTI_MAX_CHARS_PER_STAGE", "1400"))
@@ -157,31 +161,46 @@ def generate_with_open_interpreter(prompt: str) -> str:
     if not BotConfig.enable_open_interpreter:
         return "Open Interpreter 기능이 비활성화되어 있습니다. (.env에서 ENABLE_OPEN_INTERPRETER=true 설정)"
 
-    quoted_prompt = shlex.quote(prompt)
-    command = BotConfig.oi_command_template.format(prompt=quoted_prompt)
+    command_templates = [
+        BotConfig.oi_command_template,
+        BotConfig.oi_fallback_command_template,
+    ]
+    errors: List[str] = []
 
-    completed = subprocess.run(
-        command,
-        shell=True,
-        text=True,
-        capture_output=True,
-        timeout=BotConfig.oi_timeout_seconds,
+    for template in command_templates:
+        formatted = template.format(prompt=prompt)
+        argv = shlex.split(formatted)
+        try:
+            completed = subprocess.run(
+                argv,
+                text=True,
+                capture_output=True,
+                timeout=BotConfig.oi_timeout_seconds,
+            )
+        except FileNotFoundError as exc:
+            errors.append(f"{' '.join(argv[:3])}... 실행 파일 없음: {exc}")
+            continue
+
+        stdout = (completed.stdout or "").strip()
+        stderr = (completed.stderr or "").strip()
+        if completed.returncode == 0:
+            combined = stdout if stdout else "(Open Interpreter 출력 없음)"
+            if stderr:
+                combined += f"\n\n[stderr]\n{stderr}"
+            if len(combined) > BotConfig.oi_output_limit:
+                combined = combined[: BotConfig.oi_output_limit] + "\n\n... (출력 잘림)"
+            return combined
+
+        snippet_out = stdout[:300] if stdout else "stdout 없음"
+        snippet_err = stderr[:300] if stderr else "stderr 없음"
+        errors.append(
+            f"실패(code={completed.returncode}) cmd={' '.join(argv[:5])}... | {snippet_out} | {snippet_err}"
+        )
+
+    raise RuntimeError(
+        "Open Interpreter 실행 실패. 시도한 명령 모두 실패했습니다.\n"
+        + "\n".join(f"- {item}" for item in errors)
     )
-
-    stdout = (completed.stdout or "").strip()
-    stderr = (completed.stderr or "").strip()
-
-    if completed.returncode != 0:
-        raise RuntimeError(f"Open Interpreter 실패(code={completed.returncode}): {stderr or 'stderr 없음'}")
-
-    combined = stdout if stdout else "(Open Interpreter 출력 없음)"
-    if stderr:
-        combined += f"\n\n[stderr]\n{stderr}"
-
-    if len(combined) > BotConfig.oi_output_limit:
-        combined = combined[: BotConfig.oi_output_limit] + "\n\n... (출력 잘림)"
-
-    return combined
 
 
 def format_models() -> str:

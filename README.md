@@ -39,6 +39,7 @@ OLLAMA_NUM_CTX=4096
 
 ENABLE_OPEN_INTERPRETER=true
 OI_COMMAND_TEMPLATE=interpreter --yes --offline --message {prompt}
+OI_FALLBACK_COMMAND_TEMPLATE=python3 -m interpreter --yes --offline --message {prompt}
 OI_TIMEOUT_SECONDS=1800
 OI_OUTPUT_LIMIT=3500
 MULTI_MAX_CHARS_PER_STAGE=1400
@@ -66,3 +67,4 @@ python3 local_multi_ai_assistant.py
 ## Open Interpreter 관련 주의
 - `/oi`는 실제 로컬 명령을 실행할 수 있으므로 운영 환경에서 접근 가능한 텔레그램 사용자/채팅을 제한하세요.
 - 필요 시 `ENABLE_OPEN_INTERPRETER=false`로 즉시 비활성화할 수 있습니다.
+- `/oi` 실패 시 기본 명령(`OI_COMMAND_TEMPLATE`) 이후 fallback 명령(`OI_FALLBACK_COMMAND_TEMPLATE`)을 순차 시도합니다.
