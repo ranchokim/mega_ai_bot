@@ -71,8 +71,13 @@ class BotConfig:
         "OI_COMMAND_TEMPLATE",
         'interpreter --yes --offline --message {prompt}',
     )
+    oi_fallback_command_template: str = os.getenv(
+        "OI_FALLBACK_COMMAND_TEMPLATE",
+        'python3 -m interpreter --yes --offline --message {prompt}',
+    )
     oi_timeout_seconds: int = int(os.getenv("OI_TIMEOUT_SECONDS", "1800"))
     oi_output_limit: int = int(os.getenv("OI_OUTPUT_LIMIT", "3500"))
+    multi_max_chars_per_stage: int = int(os.getenv("MULTI_MAX_CHARS_PER_STAGE", "1400"))
 
 
 def tg_api(method: str, payload: dict) -> dict:
@@ -123,13 +128,14 @@ def route_task(text: str) -> Tuple[str, str]:
     return "ollama_fast", text
 
 
-def generate_with_ollama(model: str, prompt: str) -> str:
-    system_prompt = (
-        "당신은 한국어 우선의 로컬 AI 비서다.\n"
-        "- 답변은 실행 가능한 단계로 제시한다.\n"
-        "- 장문 작업은 핵심 요약을 먼저 제공한다.\n"
-        "- 불확실하면 가정 사항을 명확히 밝힌다."
-    )
+def generate_with_ollama(model: str, prompt: str, system_prompt: Optional[str] = None) -> str:
+    if system_prompt is None:
+        system_prompt = (
+            "당신은 한국어 우선의 로컬 AI 비서다.\n"
+            "- 답변은 실행 가능한 단계로 제시한다.\n"
+            "- 장문 작업은 핵심 요약을 먼저 제공한다.\n"
+            "- 불확실하면 가정 사항을 명확히 밝힌다."
+        )
     payload = {
         "model": model,
         "stream": False,
@@ -155,31 +161,46 @@ def generate_with_open_interpreter(prompt: str) -> str:
     if not BotConfig.enable_open_interpreter:
         return "Open Interpreter 기능이 비활성화되어 있습니다. (.env에서 ENABLE_OPEN_INTERPRETER=true 설정)"
 
-    quoted_prompt = shlex.quote(prompt)
-    command = BotConfig.oi_command_template.format(prompt=quoted_prompt)
+    command_templates = [
+        BotConfig.oi_command_template,
+        BotConfig.oi_fallback_command_template,
+    ]
+    errors: List[str] = []
 
-    completed = subprocess.run(
-        command,
-        shell=True,
-        text=True,
-        capture_output=True,
-        timeout=BotConfig.oi_timeout_seconds,
+    for template in command_templates:
+        formatted = template.format(prompt=prompt)
+        argv = shlex.split(formatted)
+        try:
+            completed = subprocess.run(
+                argv,
+                text=True,
+                capture_output=True,
+                timeout=BotConfig.oi_timeout_seconds,
+            )
+        except FileNotFoundError as exc:
+            errors.append(f"{' '.join(argv[:3])}... 실행 파일 없음: {exc}")
+            continue
+
+        stdout = (completed.stdout or "").strip()
+        stderr = (completed.stderr or "").strip()
+        if completed.returncode == 0:
+            combined = stdout if stdout else "(Open Interpreter 출력 없음)"
+            if stderr:
+                combined += f"\n\n[stderr]\n{stderr}"
+            if len(combined) > BotConfig.oi_output_limit:
+                combined = combined[: BotConfig.oi_output_limit] + "\n\n... (출력 잘림)"
+            return combined
+
+        snippet_out = stdout[:300] if stdout else "stdout 없음"
+        snippet_err = stderr[:300] if stderr else "stderr 없음"
+        errors.append(
+            f"실패(code={completed.returncode}) cmd={' '.join(argv[:5])}... | {snippet_out} | {snippet_err}"
+        )
+
+    raise RuntimeError(
+        "Open Interpreter 실행 실패. 시도한 명령 모두 실패했습니다.\n"
+        + "\n".join(f"- {item}" for item in errors)
     )
-
-    stdout = (completed.stdout or "").strip()
-    stderr = (completed.stderr or "").strip()
-
-    if completed.returncode != 0:
-        raise RuntimeError(f"Open Interpreter 실패(code={completed.returncode}): {stderr or 'stderr 없음'}")
-
-    combined = stdout if stdout else "(Open Interpreter 출력 없음)"
-    if stderr:
-        combined += f"\n\n[stderr]\n{stderr}"
-
-    if len(combined) > BotConfig.oi_output_limit:
-        combined = combined[: BotConfig.oi_output_limit] + "\n\n... (출력 잘림)"
-
-    return combined
 
 
 def format_models() -> str:
@@ -189,27 +210,86 @@ def format_models() -> str:
         lines.append(f"- {key}: {profile.name}{tag} | {profile.role}")
     lines.append("- oi: Open Interpreter CLI 실행")
     lines.append("\n명령 예시: /fast 질문, /code 코드질문, /reason 복잡한추론, /oi 쉘작업")
+    lines.append("일반/코드/추론 질의는 모델들이 역할을 나눠 순차 협업 후 최종 답을 생성합니다.")
     return "\n".join(lines)
+
+
+def summarize_for_chain(text: str) -> str:
+    cleaned = text.strip()
+    if len(cleaned) <= BotConfig.multi_max_chars_per_stage:
+        return cleaned
+    return cleaned[: BotConfig.multi_max_chars_per_stage] + "\n...(중간 출력 생략)"
+
+
+def run_multi_model_chain(chat_id: int, status_msg_id: int, task: str, specialist: ModelProfile) -> str:
+    planner = MODEL_PROFILES["fast"]
+    verifier = MODEL_PROFILES["fallback"]
+    synthesizer = MODEL_PROFILES["general"]
+
+    planner_system = (
+        "역할: 작업 계획가.\n"
+        "요청을 분석해서 목표/가정/필요 산출물/실행 순서를 간단히 정리하라.\n"
+        "최대 8줄로 작성."
+    )
+    plan = generate_with_ollama(planner.name, task, planner_system)
+    edit_message(chat_id, status_msg_id, f"진행중 1/4: 계획 수립 완료 ({planner.name})")
+
+    specialist_system = (
+        f"역할: {specialist.role} 전문가.\n"
+        "입력된 계획을 바탕으로 핵심 결과를 작성하라.\n"
+        "필요시 근거/코드/단계를 포함하라."
+    )
+    specialist_prompt = f"[사용자 요청]\n{task}\n\n[계획]\n{summarize_for_chain(plan)}"
+    specialist_answer = generate_with_ollama(specialist.name, specialist_prompt, specialist_system)
+    edit_message(chat_id, status_msg_id, f"진행중 2/4: 전문가 초안 완료 ({specialist.name})")
+
+    verifier_system = (
+        "역할: 검토자.\n"
+        "초안의 오류 가능성/누락/위험 요소를 간단히 지적하고 개선안을 제시하라.\n"
+        "출력은 '점검결과' 섹션으로만 작성."
+    )
+    verifier_prompt = (
+        f"[사용자 요청]\n{task}\n\n[전문가 초안]\n{summarize_for_chain(specialist_answer)}"
+    )
+    review = generate_with_ollama(verifier.name, verifier_prompt, verifier_system)
+    edit_message(chat_id, status_msg_id, f"진행중 3/4: 검토 완료 ({verifier.name})")
+
+    synth_system = (
+        "역할: 최종 편집자.\n"
+        "계획/초안/검토를 종합하여 최종 답변을 한국어로 작성하라.\n"
+        "형식: 1) 핵심요약 2) 실행단계 3) 주의사항.\n"
+        "불확실한 정보는 '가정'으로 표시."
+    )
+    synth_prompt = (
+        f"[사용자 요청]\n{task}\n\n"
+        f"[계획]\n{summarize_for_chain(plan)}\n\n"
+        f"[전문가 초안]\n{summarize_for_chain(specialist_answer)}\n\n"
+        f"[검토 결과]\n{summarize_for_chain(review)}"
+    )
+    final_answer = generate_with_ollama(synthesizer.name, synth_prompt, synth_system)
+    edit_message(chat_id, status_msg_id, f"진행중 4/4: 최종 합성 완료 ({synthesizer.name})")
+    return final_answer
 
 
 def handle_ollama(chat_id: int, msg_id: int, task: str, profile: ModelProfile) -> None:
     status_msg = send_message(
         chat_id,
-        f"진행중: 작업 분석 완료\n엔진: Ollama\n선택 모델: {profile.name}\n이제 생성 시작...",
+        "진행중: 멀티 모델 협업 파이프라인 시작\n"
+        "순차 실행으로 자원 과부하를 줄이며 답변을 합성합니다.",
         reply_to=msg_id,
     )
     status_msg_id = status_msg["message_id"]
 
     start = time.time()
     try:
-        answer = generate_with_ollama(profile.name, task)
+        answer = run_multi_model_chain(chat_id, status_msg_id, task, profile)
         elapsed = time.time() - start
-        edit_message(chat_id, status_msg_id, f"완료: {elapsed:.1f}초\n엔진: Ollama\n모델: {profile.name}")
+        edit_message(chat_id, status_msg_id, f"완료: {elapsed:.1f}초\n엔진: Ollama 멀티 모델 순차 협업")
         send_message(chat_id, answer, reply_to=msg_id)
     except Exception as exc:
         fallback = MODEL_PROFILES["fallback"]
         try:
-            edit_message(chat_id, status_msg_id, f"오류: {profile.name} 실패 → {fallback.name} 재시도")
+            edit_message(chat_id, status_msg_id, f"오류: 협업 파이프라인 실패 → {fallback.name} 단일 응답 재시도")
             answer = generate_with_ollama(fallback.name, task)
             send_message(chat_id, f"(fallback:{fallback.name})\n\n{answer}", reply_to=msg_id)
         except Exception as exc2:
@@ -245,7 +325,7 @@ def handle_command(chat_id: int, msg_id: int, text: str) -> None:
             "- Open Interpreter: /oi\n"
             "- 모델목록: /models\n"
             "- 상태: /status\n"
-            "아무 텍스트나 보내도 기본 fast 라우팅합니다.",
+            "일반 텍스트는 멀티 모델 순차 협업으로 처리합니다.",
             reply_to=msg_id,
         )
         return
