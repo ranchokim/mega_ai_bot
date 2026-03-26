@@ -38,6 +38,7 @@ OLLAMA_TIMEOUT_SECONDS=1800
 OLLAMA_NUM_CTX=4096
 
 ENABLE_OPEN_INTERPRETER=true
+OI_MODEL=qwen3:latest
 OI_COMMAND_TEMPLATE=interpreter --yes --offline --message {prompt}
 OI_FALLBACK_COMMAND_TEMPLATE=python3 -m interpreter --yes --offline --message {prompt}
 OI_TIMEOUT_SECONDS=1800
@@ -69,6 +70,11 @@ python3 local_multi_ai_assistant.py
 - `/oi`는 실제 로컬 명령을 실행할 수 있으므로 운영 환경에서 접근 가능한 텔레그램 사용자/채팅을 제한하세요.
 - 필요 시 `ENABLE_OPEN_INTERPRETER=false`로 즉시 비활성화할 수 있습니다.
 - `/oi` 실패 시 기본 명령(`OI_COMMAND_TEMPLATE`) 이후 fallback 명령(`OI_FALLBACK_COMMAND_TEMPLATE`)을 순차 시도합니다.
+- Open Interpreter Python API 사용 시 내부 설정은 아래처럼 강제됩니다:
+  - `interpreter.llm.model = "ollama/{OI_MODEL}"`
+  - `interpreter.llm.api_base = OLLAMA_BASE_URL`
+  - `interpreter.llm.supports_functions = False`
+  - `interpreter.auto_run = True`
 
 ## 단계별 결과 파일 저장
 - 멀티 모델 체인은 각 단계 결과를 워크스페이스 디렉토리에 파일로 저장합니다.

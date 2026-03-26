@@ -7,6 +7,7 @@ import os
 import shlex
 import subprocess
 import time
+import importlib
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -77,6 +78,7 @@ class BotConfig:
     )
     oi_timeout_seconds: int = int(os.getenv("OI_TIMEOUT_SECONDS", "1800"))
     oi_output_limit: int = int(os.getenv("OI_OUTPUT_LIMIT", "3500"))
+    oi_model: str = os.getenv("OI_MODEL", MODEL_PROFILES["fast"].name)
     multi_max_chars_per_stage: int = int(os.getenv("MULTI_MAX_CHARS_PER_STAGE", "1400"))
     workspace_dir: str = os.getenv("CHAIN_WORKSPACE_DIR", "workspace_steps")
 
@@ -162,11 +164,44 @@ def generate_with_open_interpreter(prompt: str) -> str:
     if not BotConfig.enable_open_interpreter:
         return "Open Interpreter 기능이 비활성화되어 있습니다. (.env에서 ENABLE_OPEN_INTERPRETER=true 설정)"
 
+    # 1) Python API 경로 우선 사용
+    try:
+        oi_module = importlib.import_module("interpreter")
+        oi = oi_module.interpreter
+        oi.llm.model = f"ollama/{BotConfig.oi_model}"
+        oi.llm.api_base = BotConfig.ollama_url
+        oi.llm.supports_functions = False
+        oi.auto_run = True
+
+        result = oi.chat(prompt)
+        if isinstance(result, str):
+            output = result.strip()
+        elif isinstance(result, list):
+            chunks: List[str] = []
+            for item in result:
+                if isinstance(item, dict):
+                    content = item.get("content")
+                    if isinstance(content, str) and content.strip():
+                        chunks.append(content.strip())
+            output = "\n".join(chunks).strip()
+        else:
+            output = str(result).strip()
+
+        if not output:
+            output = "(Open Interpreter 출력 없음)"
+
+        if len(output) > BotConfig.oi_output_limit:
+            output = output[: BotConfig.oi_output_limit] + "\n\n... (출력 잘림)"
+        return output
+    except Exception as api_exc:
+        api_error = str(api_exc)
+
+    # 2) CLI fallback 경로
     command_templates = [
         BotConfig.oi_command_template,
         BotConfig.oi_fallback_command_template,
     ]
-    errors: List[str] = []
+    errors: List[str] = [f"python-api 실패: {api_error}"]
 
     for template in command_templates:
         formatted = template.format(prompt=prompt)
