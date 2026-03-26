@@ -8,6 +8,9 @@ import shlex
 import subprocess
 import time
 import importlib
+import json
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -81,6 +84,9 @@ class BotConfig:
     oi_model: str = os.getenv("OI_MODEL", MODEL_PROFILES["fast"].name)
     multi_max_chars_per_stage: int = int(os.getenv("MULTI_MAX_CHARS_PER_STAGE", "1400"))
     workspace_dir: str = os.getenv("CHAIN_WORKSPACE_DIR", "workspace_steps")
+    memory_reset_hour: int = int(os.getenv("MEMORY_RESET_HOUR", "3"))
+    memory_timezone: str = os.getenv("MEMORY_TIMEZONE", "Asia/Seoul")
+    memory_max_entries: int = int(os.getenv("MEMORY_MAX_ENTRIES", "30"))
 
 
 def tg_api(method: str, payload: dict) -> dict:
@@ -257,6 +263,65 @@ def summarize_for_chain(text: str) -> str:
     return cleaned[: BotConfig.multi_max_chars_per_stage] + "\n...(중간 출력 생략)"
 
 
+def get_memory_bucket_date(now: Optional[datetime] = None) -> str:
+    tz = ZoneInfo(BotConfig.memory_timezone)
+    current = now.astimezone(tz) if now else datetime.now(tz)
+    if current.hour < BotConfig.memory_reset_hour:
+        current = current - timedelta(days=1)
+    return current.strftime("%Y-%m-%d")
+
+
+def get_memory_file_path(chat_id: int, now: Optional[datetime] = None) -> str:
+    bucket = get_memory_bucket_date(now)
+    memory_dir = os.path.join(BotConfig.workspace_dir, "memory")
+    os.makedirs(memory_dir, exist_ok=True)
+    return os.path.join(memory_dir, f"{chat_id}_{bucket}.jsonl")
+
+
+def append_daily_memory(chat_id: int, role: str, text: str) -> None:
+    payload = {
+        "ts": datetime.now(ZoneInfo(BotConfig.memory_timezone)).isoformat(),
+        "role": role,
+        "text": text.strip(),
+    }
+    path = get_memory_file_path(chat_id)
+    with open(path, "a", encoding="utf-8") as fp:
+        fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def load_daily_memory(chat_id: int) -> List[dict]:
+    path = get_memory_file_path(chat_id)
+    if not os.path.exists(path):
+        return []
+    rows: List[dict] = []
+    with open(path, "r", encoding="utf-8") as fp:
+        for line in fp:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    if len(rows) > BotConfig.memory_max_entries:
+        rows = rows[-BotConfig.memory_max_entries :]
+    return rows
+
+
+def format_daily_memory(chat_id: int) -> str:
+    rows = load_daily_memory(chat_id)
+    if not rows:
+        return "(오늘 저장된 대화 기억 없음)"
+    lines: List[str] = []
+    for row in rows:
+        role = row.get("role", "unknown")
+        text = str(row.get("text", "")).strip()
+        if not text:
+            continue
+        lines.append(f"- {role}: {summarize_for_chain(text)}")
+    return "\n".join(lines) if lines else "(오늘 저장된 대화 기억 없음)"
+
+
 def _safe_model_name(model_name: str) -> str:
     return "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in model_name)
 
@@ -284,10 +349,12 @@ def run_multi_model_chain(
 
     planner_system = (
         "역할: 작업 계획가.\n"
-        "요청을 분석해서 목표/가정/필요 산출물/실행 순서를 간단히 정리하라.\n"
+        "요청과 오늘의 대화 기억을 분석해서 목표/가정/필요 산출물/실행 순서를 간단히 정리하라.\n"
         "최대 8줄로 작성."
     )
-    plan = generate_with_ollama(planner.name, task, planner_system)
+    daily_memory = format_daily_memory(chat_id)
+    planner_prompt = f"[오늘의 대화 기억]\n{daily_memory}\n\n[사용자 요청]\n{task}"
+    plan = generate_with_ollama(planner.name, planner_prompt, planner_system)
     plan_path = save_chain_stage_result(request_id, 1, "plan", planner.name, plan)
     edit_message(chat_id, status_msg_id, f"진행중 1/4: 계획 수립 완료 ({planner.name})")
 
@@ -350,11 +417,13 @@ def handle_ollama(chat_id: int, msg_id: int, task: str, profile: ModelProfile) -
 
     start = time.time()
     request_id = f"{int(start)}_{chat_id}_{msg_id}"
+    append_daily_memory(chat_id, "user", task)
     try:
         answer = run_multi_model_chain(chat_id, status_msg_id, task, profile, request_id)
         elapsed = time.time() - start
         edit_message(chat_id, status_msg_id, f"완료: {elapsed:.1f}초\n엔진: Ollama 멀티 모델 순차 협업")
         send_message(chat_id, answer, reply_to=msg_id)
+        append_daily_memory(chat_id, "assistant", answer)
     except Exception as exc:
         fallback = MODEL_PROFILES["fallback"]
         try:

@@ -45,6 +45,9 @@ OI_TIMEOUT_SECONDS=1800
 OI_OUTPUT_LIMIT=3500
 MULTI_MAX_CHARS_PER_STAGE=1400
 CHAIN_WORKSPACE_DIR=workspace_steps
+MEMORY_RESET_HOUR=3
+MEMORY_TIMEZONE=Asia/Seoul
+MEMORY_MAX_ENTRIES=30
 ```
 
 > 보안 권장: 토큰이 이미 외부에 노출됐다면 BotFather에서 즉시 재발급(rotate) 하세요.
@@ -84,3 +87,9 @@ python3 local_multi_ai_assistant.py
   - `{request_id}_02_specialist_{model}.md`
   - `{request_id}_03_review_{model}.md`
   - `{request_id}_04_synthesis_{model}.md`
+
+## 일 단위 대화 기억(03:00 초기화)
+- 각 채팅의 대화를 `workspace_steps/memory/{chat_id}_{bucket_date}.jsonl`에 저장합니다.
+- 계획 단계는 오늘의 저장된 기억을 함께 읽어 참고합니다.
+- `MEMORY_RESET_HOUR=3` 기준으로 매일 새벽 3시에 새로운 버킷으로 넘어가며, 이전 기억은 자동으로 참조 대상에서 제외됩니다.
+- 시간대는 `MEMORY_TIMEZONE`으로 제어합니다(기본 `Asia/Seoul`).
