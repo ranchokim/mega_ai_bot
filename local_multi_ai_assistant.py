@@ -45,6 +45,11 @@ MODEL_PROFILES: Dict[str, ModelProfile] = {
         role="일반 지식/작성",
         description="4.9GB급으로 안정적인 품질",
     ),
+    "verifier": ModelProfile(
+        name="llama3.1:8b",
+        role="검토/비평",
+        description="검토자는 최소 동급 이상 모델을 사용해 품질 확보",
+    ),
     "code": ModelProfile(
         name="qwen3-coder:30b",
         role="코드/디버깅",
@@ -484,7 +489,7 @@ def run_multi_model_chain(
     request_id: str,
 ) -> str:
     planner = MODEL_PROFILES["fast"]
-    verifier = MODEL_PROFILES["general"]
+    verifier = MODEL_PROFILES["verifier"]
     synthesizer = MODEL_PROFILES["general"]
 
     planner_system = (

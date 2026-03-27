@@ -8,7 +8,7 @@
 - 모델 역할 분담 + 순차 실행 기반 협업 응답 (Ollama)
   - 1단계 계획: `qwen3:latest`
   - 2단계 전문가: 작업 유형별 모델(`qwen3-coder:30b`, `deepseek-r1:32b`, `llama3.1:8b` 등)
-  - 3단계 검토: `phi3:latest`
+  - 3단계 검토: `llama3.1:8b` (Verifier)
   - 4단계 합성: `llama3.1:8b`
   - 실패 시 fallback 단일 응답
 - `/oi` 명령으로 Open Interpreter CLI 작업 실행
