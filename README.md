@@ -12,6 +12,7 @@
   - 4단계 합성: `llama3.1:8b`
   - 실패 시 fallback 단일 응답
 - `/oi` 명령으로 Open Interpreter CLI 작업 실행
+- Planner가 필요 시 Open Interpreter를 자동 선택(Agentic tool calling 유사 흐름)
 
 ## 왜 이 구성이 실용적인가
 - VRAM 10GB에서는 30B/32B를 기본 모델로 두면 지연이 큽니다.
@@ -48,6 +49,9 @@ CHAIN_WORKSPACE_DIR=workspace_steps
 MEMORY_RESET_HOUR=3
 MEMORY_TIMEZONE=Asia/Seoul
 MEMORY_MAX_ENTRIES=30
+RAG_DB_PATH=workspace_steps/memory_rag.sqlite3
+RAG_TOP_K=4
+RAG_EMBED_DIM=256
 ```
 
 > 보안 권장: 토큰이 이미 외부에 노출됐다면 BotFather에서 즉시 재발급(rotate) 하세요.
@@ -78,6 +82,7 @@ python3 local_multi_ai_assistant.py
   - `interpreter.llm.api_base = OLLAMA_BASE_URL`
   - `interpreter.llm.supports_functions = False`
   - `interpreter.auto_run = True`
+- 일반 질의에서도 Planner가 도구가 필요하다고 판단하면 `/oi` 없이 자동 실행할 수 있습니다.
 
 ## 단계별 결과 파일 저장
 - 멀티 모델 체인은 각 단계 결과를 워크스페이스 디렉토리에 파일로 저장합니다.
@@ -93,3 +98,12 @@ python3 local_multi_ai_assistant.py
 - 계획 단계는 오늘의 저장된 기억을 함께 읽어 참고합니다.
 - `MEMORY_RESET_HOUR=3` 기준으로 매일 새벽 3시에 새로운 버킷으로 넘어가며, 이전 기억은 자동으로 참조 대상에서 제외됩니다.
 - 시간대는 `MEMORY_TIMEZONE`으로 제어합니다(기본 `Asia/Seoul`).
+
+## 장기 기억 검색(RAG)
+- 대화는 임베딩 형태로 SQLite 기반 경량 벡터 저장소(`RAG_DB_PATH`)에도 저장됩니다.
+- 계획 단계에서 요청과 의미적으로 유사한 과거 기억 상위 `RAG_TOP_K`개를 검색해 프롬프트에 주입합니다.
+- 임베딩 차원은 `RAG_EMBED_DIM`으로 조정 가능합니다(기본 256).
+
+## 순환형 보정(Reviewer → Specialist Retry)
+- 검토 결과가 심각한 오류/누락으로 판단되면, 검토 피드백을 기반으로 전문가 단계를 자동 1회 재실행합니다.
+- 재실행 산출물도 워크스페이스 파일로 저장됩니다.

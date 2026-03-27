@@ -9,6 +9,10 @@ import subprocess
 import time
 import importlib
 import json
+import math
+import hashlib
+import re
+import sqlite3
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from dataclasses import dataclass
@@ -87,6 +91,9 @@ class BotConfig:
     memory_reset_hour: int = int(os.getenv("MEMORY_RESET_HOUR", "3"))
     memory_timezone: str = os.getenv("MEMORY_TIMEZONE", "Asia/Seoul")
     memory_max_entries: int = int(os.getenv("MEMORY_MAX_ENTRIES", "30"))
+    rag_db_path: str = os.getenv("RAG_DB_PATH", os.path.join(workspace_dir, "memory_rag.sqlite3"))
+    rag_top_k: int = int(os.getenv("RAG_TOP_K", "4"))
+    rag_embed_dim: int = int(os.getenv("RAG_EMBED_DIM", "256"))
 
 
 def tg_api(method: str, payload: dict) -> dict:
@@ -278,15 +285,100 @@ def get_memory_file_path(chat_id: int, now: Optional[datetime] = None) -> str:
     return os.path.join(memory_dir, f"{chat_id}_{bucket}.jsonl")
 
 
+def init_rag_db() -> None:
+    os.makedirs(BotConfig.workspace_dir, exist_ok=True)
+    conn = sqlite3.connect(BotConfig.rag_db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                ts TEXT NOT NULL,
+                role TEXT NOT NULL,
+                text TEXT NOT NULL,
+                embedding TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def tokenize(text: str) -> List[str]:
+    return [tok for tok in re.split(r"[^0-9A-Za-z가-힣_]+", text.lower()) if tok]
+
+
+def embed_text(text: str) -> List[float]:
+    vec = [0.0] * BotConfig.rag_embed_dim
+    tokens = tokenize(text)
+    if not tokens:
+        return vec
+    for token in tokens:
+        digest = hashlib.sha256(token.encode("utf-8")).digest()
+        idx = int.from_bytes(digest[:4], "big") % BotConfig.rag_embed_dim
+        vec[idx] += 1.0
+    norm = math.sqrt(sum(v * v for v in vec))
+    if norm > 0:
+        vec = [v / norm for v in vec]
+    return vec
+
+
+def cosine_similarity(a: List[float], b: List[float]) -> float:
+    return sum(x * y for x, y in zip(a, b))
+
+
+def rag_add_memory(chat_id: int, role: str, text: str, ts: str) -> None:
+    init_rag_db()
+    emb = embed_text(text)
+    conn = sqlite3.connect(BotConfig.rag_db_path)
+    try:
+        conn.execute(
+            "INSERT INTO memories(chat_id, ts, role, text, embedding) VALUES (?, ?, ?, ?, ?)",
+            (chat_id, ts, role, text, json.dumps(emb)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def rag_search(chat_id: int, query: str, top_k: Optional[int] = None) -> List[dict]:
+    init_rag_db()
+    k = top_k or BotConfig.rag_top_k
+    query_emb = embed_text(query)
+    conn = sqlite3.connect(BotConfig.rag_db_path)
+    try:
+        rows = conn.execute(
+            "SELECT ts, role, text, embedding FROM memories WHERE chat_id = ? ORDER BY id DESC LIMIT 1000",
+            (chat_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    scored: List[dict] = []
+    for ts, role, text, emb_json in rows:
+        try:
+            emb = json.loads(emb_json)
+        except json.JSONDecodeError:
+            continue
+        score = cosine_similarity(query_emb, emb)
+        scored.append({"score": score, "ts": ts, "role": role, "text": text})
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return scored[:k]
+
+
 def append_daily_memory(chat_id: int, role: str, text: str) -> None:
+    timestamp = datetime.now(ZoneInfo(BotConfig.memory_timezone)).isoformat()
     payload = {
-        "ts": datetime.now(ZoneInfo(BotConfig.memory_timezone)).isoformat(),
+        "ts": timestamp,
         "role": role,
         "text": text.strip(),
     }
     path = get_memory_file_path(chat_id)
     with open(path, "a", encoding="utf-8") as fp:
         fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    rag_add_memory(chat_id, role, text.strip(), timestamp)
 
 
 def load_daily_memory(chat_id: int) -> List[dict]:
@@ -308,18 +400,66 @@ def load_daily_memory(chat_id: int) -> List[dict]:
     return rows
 
 
-def format_daily_memory(chat_id: int) -> str:
+def format_daily_memory(chat_id: int, query: str) -> str:
     rows = load_daily_memory(chat_id)
-    if not rows:
-        return "(오늘 저장된 대화 기억 없음)"
+    similar_rows = rag_search(chat_id, query, BotConfig.rag_top_k)
+    if not rows and not similar_rows:
+        return "(오늘 저장된 대화 기억 및 유사 기억 없음)"
     lines: List[str] = []
-    for row in rows:
+    lines.append("[오늘 대화 요약]")
+    for row in rows[-BotConfig.memory_max_entries :]:
         role = row.get("role", "unknown")
         text = str(row.get("text", "")).strip()
         if not text:
             continue
         lines.append(f"- {role}: {summarize_for_chain(text)}")
-    return "\n".join(lines) if lines else "(오늘 저장된 대화 기억 없음)"
+    lines.append("\n[유사 과거 기억(RAG)]")
+    for item in similar_rows:
+        if item["score"] <= 0:
+            continue
+        lines.append(f"- {item['role']}({item['ts']}): {summarize_for_chain(item['text'])}")
+    return "\n".join(lines)
+
+
+def parse_json_object(raw_text: str) -> Optional[dict]:
+    raw = raw_text.strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        return json.loads(raw[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+
+
+def planner_tool_decision(task: str, memory_context: str, planner: ModelProfile) -> Tuple[bool, str, str]:
+    decision_system = (
+        "역할: Planner with Tool Choice.\n"
+        "Open Interpreter 도구 사용 여부를 스스로 결정하라.\n"
+        "JSON만 출력: {\"use_oi\": bool, \"reason\": str, \"oi_task\": str}\n"
+        "파일 정리/쉘명령/실제 시스템조작이 필요하면 use_oi=true."
+    )
+    decision_prompt = f"[기억]\n{memory_context}\n\n[요청]\n{task}"
+    raw = generate_with_ollama(planner.name, decision_prompt, decision_system)
+    parsed = parse_json_object(raw)
+    if not parsed:
+        heuristic = any(k in task.lower() for k in ["폴더", "파일", "터미널", "정리", "삭제", "실행", "shell"])
+        return heuristic, "heuristic fallback", task
+    use_oi = bool(parsed.get("use_oi", False))
+    reason = str(parsed.get("reason", "")).strip() or "no reason"
+    oi_task = str(parsed.get("oi_task", "")).strip() or task
+    return use_oi, reason, oi_task
+
+
+def review_needs_retry(review_text: str) -> bool:
+    lowered = review_text.lower()
+    signals = ["치명", "심각", "누락", "오류", "재작성", "수정 필요", "틀림", "불충분"]
+    return any(sig in lowered for sig in signals)
 
 
 def _safe_model_name(model_name: str) -> str:
@@ -344,7 +484,7 @@ def run_multi_model_chain(
     request_id: str,
 ) -> str:
     planner = MODEL_PROFILES["fast"]
-    verifier = MODEL_PROFILES["fallback"]
+    verifier = MODEL_PROFILES["general"]
     synthesizer = MODEL_PROFILES["general"]
 
     planner_system = (
@@ -352,8 +492,21 @@ def run_multi_model_chain(
         "요청과 오늘의 대화 기억을 분석해서 목표/가정/필요 산출물/실행 순서를 간단히 정리하라.\n"
         "최대 8줄로 작성."
     )
-    daily_memory = format_daily_memory(chat_id)
-    planner_prompt = f"[오늘의 대화 기억]\n{daily_memory}\n\n[사용자 요청]\n{task}"
+    daily_memory = format_daily_memory(chat_id, task)
+    use_oi, tool_reason, oi_task = planner_tool_decision(task, daily_memory, planner)
+    tool_output = "(도구 미사용)"
+    if use_oi:
+        try:
+            tool_output = generate_with_open_interpreter(oi_task)
+        except Exception as tool_exc:
+            tool_output = f"(도구 실행 실패: {tool_exc})"
+        save_chain_stage_result(request_id, 0, "tool", BotConfig.oi_model, tool_output)
+    planner_prompt = (
+        f"[오늘의 대화 기억]\n{daily_memory}\n\n"
+        f"[도구 선택]\nuse_oi={use_oi}, reason={tool_reason}\n\n"
+        f"[도구 실행 결과]\n{summarize_for_chain(tool_output)}\n\n"
+        f"[사용자 요청]\n{task}"
+    )
     plan = generate_with_ollama(planner.name, planner_prompt, planner_system)
     plan_path = save_chain_stage_result(request_id, 1, "plan", planner.name, plan)
     edit_message(chat_id, status_msg_id, f"진행중 1/4: 계획 수립 완료 ({planner.name})")
@@ -374,11 +527,24 @@ def run_multi_model_chain(
         "출력은 '점검결과' 섹션으로만 작성."
     )
     verifier_prompt = (
-        f"[사용자 요청]\n{task}\n\n[전문가 초안]\n{summarize_for_chain(specialist_answer)}"
+        f"[사용자 요청]\n{task}\n\n[전문가 초안]\n{summarize_for_chain(specialist_answer)}\n\n"
+        f"[도구 결과]\n{summarize_for_chain(tool_output)}"
     )
     review = generate_with_ollama(verifier.name, verifier_prompt, verifier_system)
     review_path = save_chain_stage_result(request_id, 3, "review", verifier.name, review)
     edit_message(chat_id, status_msg_id, f"진행중 3/4: 검토 완료 ({verifier.name})")
+
+    if review_needs_retry(review):
+        retry_prompt = (
+            f"[사용자 요청]\n{task}\n\n"
+            f"[기존 초안]\n{summarize_for_chain(specialist_answer)}\n\n"
+            f"[검토 피드백]\n{summarize_for_chain(review)}\n\n"
+            f"[도구 결과]\n{summarize_for_chain(tool_output)}"
+        )
+        specialist_answer = generate_with_ollama(specialist.name, retry_prompt, specialist_system)
+        save_chain_stage_result(request_id, 5, "specialist_retry", specialist.name, specialist_answer)
+        review = generate_with_ollama(verifier.name, retry_prompt, verifier_system)
+        save_chain_stage_result(request_id, 6, "review_retry", verifier.name, review)
 
     synth_system = (
         "역할: 최종 편집자.\n"
@@ -390,7 +556,8 @@ def run_multi_model_chain(
         f"[사용자 요청]\n{task}\n\n"
         f"[계획]\n{summarize_for_chain(plan)}\n\n"
         f"[전문가 초안]\n{summarize_for_chain(specialist_answer)}\n\n"
-        f"[검토 결과]\n{summarize_for_chain(review)}"
+        f"[검토 결과]\n{summarize_for_chain(review)}\n\n"
+        f"[도구 실행 결과]\n{summarize_for_chain(tool_output)}"
     )
     final_answer = generate_with_ollama(synthesizer.name, synth_prompt, synth_system)
     final_path = save_chain_stage_result(request_id, 4, "synthesis", synthesizer.name, final_answer)
